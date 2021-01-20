@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 from datetime import datetime
+from io import BytesIO
 from time import sleep, time
 
 import pandas as pd
@@ -323,42 +325,55 @@ class TestCollectionTables(unittest.TestCase):
 
         assert_frame_equal(meta, expected_meta)
 
-    def test_expression_file_url(self):
+    def test_get_exp_uri(self):
         self.data.files.return_value = ["exp_file.csv"]
 
         ct = CollectionTables(self.collection)
-        file_url = ct._expression_file_url(self.data, EXP)
-        self.assertEqual(file_url, "https://server.com/data/12345/exp_file.csv")
+        file_url = ct._get_exp_uri(self.data, EXP)
+        self.assertEqual(file_url, "12345/exp_file.csv")
 
         self.data.files.return_value = []
         with self.assertRaises(LookupError):
-            file_url = ct._expression_file_url(self.data, EXP)
+            file_url = ct._get_exp_uri(self.data, EXP)
 
         self.data.files.return_value = ["exp_file1.csv", "exp_file2.csv"]
         with self.assertRaises(LookupError):
-            file_url = ct._expression_file_url(self.data, EXP)
+            file_url = ct._get_exp_uri(self.data, EXP)
 
-    @patch("resdk.collection_tables.BytesIO", MagicMock)
-    @patch.object(CollectionTables, "_expression_file_url", MagicMock)
-    @patch("pandas.read_csv")
-    def test_download_expressions(self, pandas_mock):
-        exp_df = pd.DataFrame(
+    def test_download_file(self):
+        expected = pd.DataFrame(
             [["ENSG001", 0], ["ENSG002", 1], ["ENSG003", 2]],
             columns=["Gene", "Expression"],
         )
-        pandas_mock.return_value = exp_df
-        return_exp = pd.DataFrame(
-            [[0, 1, 2]], columns=["ENSG001", "ENSG002", "ENSG003"], index=["Sample123"]
-        )
-        return_exp.index.name = "sample_name"
-        return_exp.columns.name = "Ensembl"
-        self.data._original_values.__getitem__.side_effect = {
-            "entity": {"name": "Sample123"}
-        }.__getitem__
+        expected = expected.set_index("Gene")
+
+        async def get_content():
+            with BytesIO() as f:
+                expected.to_csv(f, sep="\t", compression="gzip", index_label="Gene")
+                f.seek(0)
+                return f.read()
+
+        response = MagicMock(name="response")
+        response.content.read = get_content
+        ctx_mgr = MagicMock(name="ctx_mgr")
+        ctx_mgr.__aenter__.return_value = response
+        session = MagicMock(name="session")
+        session.get.return_value = ctx_mgr
+
         ct = CollectionTables(self.collection)
-        exp = ct._download_expressions(EXP)
-        assert_frame_equal(exp, return_exp)
-        self.assertEqual(exp.attrs["exp_type"], "TPM")
+        df = asyncio.run(ct._download_file("url", session, "sample1"))
+
+        self.assertListEqual(list(df.columns), list(expected.index))
+        self.assertListEqual(df.values.tolist(), [[0, 1, 2]])
+        self.assertListEqual(list(df.index), ["sample1"])
+
+    def test_download_expressions(self):
+        """
+        There is no point in such mocked tests.
+
+        We should create a e2e test for this instead.
+        """
+        pass
 
     @patch(
         "resdk.collection_tables.cache_dir_resdk", MagicMock(return_value="/tmp/resdk/")
